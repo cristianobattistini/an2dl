@@ -1,0 +1,21 @@
+# --- Core scientific stack ---
+numpy
+pandas
+scikit-learn
+matplotlib
+seaborn
+
+# --- Deep learning framework ---
+torch
+torchvision
+torchaudio
+torchsummary
+torchmetrics
+
+# --- Experiment tracking and logging ---
+tensorboard
+tqdm
+wandb
+
+# --- Optional: notebook & environment utilities ---
+ipykernel
