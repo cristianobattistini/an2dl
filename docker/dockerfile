@@ -1,0 +1,56 @@
+######################################################################
+# Dockerfile — AN2DL Challenge 1 (PyTorch, CUDA 11.8)
+# Utente: battistini (UID/GID 1170)
+######################################################################
+
+FROM pytorch/pytorch:2.2.2-cuda11.8-cudnn8-devel
+
+ARG USERNAME=battistini
+ARG USER_UID=1170
+ARG USER_GID=1170
+
+# --------------------------------------------------------------------
+# Sistema base e tool essenziali
+# --------------------------------------------------------------------
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        sudo git wget curl vim htop unzip ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# --------------------------------------------------------------------
+# Utente non-root
+# --------------------------------------------------------------------
+RUN groupadd --gid $USER_GID $USERNAME && \
+    useradd --uid $USER_UID --gid $USER_GID -m $USERNAME && \
+    echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+USER $USERNAME
+WORKDIR /home/$USERNAME/exp
+
+# --------------------------------------------------------------------
+# Ambiente
+# --------------------------------------------------------------------
+ENV MPLCONFIGDIR=/home/$USERNAME/.cache/matplotlib \
+    PYTHONUNBUFFERED=1 \
+    TOKENIZERS_PARALLELISM=false \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PATH=/home/$USERNAME/.local/bin:$PATH
+
+# --------------------------------------------------------------------
+# Installazione requisiti (torch già incluso nell’immagine base)
+# --------------------------------------------------------------------
+COPY requirements.txt /tmp/requirements.txt
+RUN python -m pip install --upgrade pip && \
+    awk '!/^(torch|torchvision|torchaudio)([>=]|==)?/' /tmp/requirements.txt > /tmp/requirements_notorch.txt && \
+    pip install --no-cache-dir -r /tmp/requirements_notorch.txt
+
+# --------------------------------------------------------------------
+# Verifica ambiente
+# --------------------------------------------------------------------
+RUN python - <<'PY'
+import torch
+print("✅ Torch:", torch.__version__, "| CUDA:", torch.version.cuda, "| GPU available:", torch.cuda.is_available())
+PY
+
+CMD ["/bin/bash"]

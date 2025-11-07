@@ -1,0 +1,26 @@
+# --- Python basics ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+*.manifest
+*.spec
+
+# --- Virtual environments ---
+.env
+.venv/
+env/
+venv/
+ENV/
+.ipynb_checkpoints/
+
+# --- avoid to push dataset
+dataset/
+/dataset/
+
+
+# --- avoid to push dataset
+configs/
+/configs/
