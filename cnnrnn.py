@@ -1851,10 +1851,10 @@ plt.show()
 # OUT_DIR = "/home/cristiano.battistini/storage/an2dl_outputs"
 
 # --- Docker / local environment ---
-OUT_DIR = os.path.join(os.getcwd(), "outputs")
+OUTPUT_DIR = os.path.join(os.getcwd(), "outputs")
 
 # --- Create directory if it doesn't exist ---
-os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 
@@ -1866,27 +1866,18 @@ def save_experiment_output(
     hyperparams: dict,
     X_test_seq: np.ndarray,
     label_mapping: dict,
-    sample_indices: list,
     output_dir: str,
+    sample_indices: list,
     model=None,
+    optimizer=None,
     batch_size: int = 256,
     window_size: int = None,
-    stride: int = None
+    stride: int = None,
+    save_window_logits: bool = False,
 ):
     """
-    Run inference on the test set, save predictions and hyperparameters.
-
-    Args:
-        model_name (str): Name of the experiment (e.g. 'lstm', 'bilstm', 'ffn').
-        hyperparams (dict): Dict containing all hyperparameters and training config.
-        X_test_seq (np.ndarray): Test sequences of shape (N_windows, W, F) — windowed data.
-        label_mapping (dict): Mapping from label string to class index.
-        sample_indices (list): List of sample_index identifiers (as strings).
-        output_dir (str): Folder where submission and metadata are saved.
-        model (torch.nn.Module): Trained model for inference.
-        batch_size (int): Inference batch size.
-        window_size (int): Window size used to create X_test_seq.
-        stride (int): Stride used to create X_test_seq.
+    Run inference on the test set, aggregate window predictions to sequence-level,
+    and save ALL experiment outputs (model, submission, config, metrics).
     """
 
     os.makedirs(output_dir, exist_ok=True)
@@ -1904,46 +1895,41 @@ def save_experiment_output(
             logits.append(model(xb).cpu().numpy())
         logits = np.concatenate(logits, axis=0)  # (N_windows, num_classes)
 
-    # Get per-window predictions
-    pred_idx_windows = logits.argmax(axis=1)  # (N_windows,)
+    # Optionally save raw logits
+    if save_window_logits:
+        np.save(os.path.join(output_dir, "window_logits.npy"), logits)
 
-    # --- Aggregate windows to sequences ---
-    # Calculate how many windows per sequence (assuming T=160)
+    # Window-level predictions
+    pred_idx_windows = logits.argmax(axis=1)
+
+    # --- Infer window/stride if missing ---
     if window_size is None or stride is None:
-        # Try to infer from hyperparams if not provided
-        window_size = hyperparams.get('window', 12)
-        stride = hyperparams.get('stride', 3)
+        window_size = hyperparams.get("window", 12)
+        stride = hyperparams.get("stride", 3)
 
     n_windows_per_seq = (160 - window_size) // stride + 1
 
     # ============= FIX: SORT SAMPLE INDICES =============
-    # CRITICAL: X_test_seq windows are created in the order that sample_indices
-    # appear in X_test. We must match this order for aggregation.
-    # If build_sequences processes sample_indices in sorted order, sort here too.
-    sample_indices = sorted(sample_indices)  # Ensure alignment
-    # ============= END FIX =============
+    sample_indices = sorted(sample_indices)
+    # =====================================================
 
-    # Group predictions by sample_index using majority vote
+    # Majority vote per sequence
     from collections import Counter
     sequence_predictions = []
 
     for idx in range(len(sample_indices)):
-        # Extract windows for this sequence
         start_idx = idx * n_windows_per_seq
         end_idx = start_idx + n_windows_per_seq
-
         window_preds = pred_idx_windows[start_idx:end_idx]
 
-        # Majority vote across windows
         vote_counts = Counter(window_preds)
         final_pred_idx = vote_counts.most_common(1)[0][0]
-
         sequence_predictions.append(final_pred_idx)
 
     # Convert indices to labels
     pred_labels = [idx2label[int(i)] for i in sequence_predictions]
 
-    # --- Build submission DataFrame ---
+    # --- Submission DataFrame ---
     submission = pd.DataFrame({
         "sample_index": [str(sid).zfill(3) for sid in sample_indices],
         "label": pred_labels
@@ -1951,8 +1937,9 @@ def save_experiment_output(
 
     # --- Build file names ---
     run_name = f"{model_name}_exp"
-    csv_path = os.path.join(output_dir, f"{run_name}_submission.csv")
+    csv_path  = os.path.join(output_dir, f"{run_name}_submission.csv")
     json_path = os.path.join(output_dir, f"{run_name}_config.json")
+    model_path = os.path.join(output_dir, "model_final.pt")
 
     # --- Save submission ---
     submission.to_csv(csv_path, index=False)
@@ -1961,9 +1948,19 @@ def save_experiment_output(
     with open(json_path, "w") as f:
         json.dump(hyperparams, f, indent=4)
 
+    # --- Save model (full state for reproducibility) ---
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
+        "hyperparams": hyperparams,
+    }, model_path)
+
     print(f"Saved submission at: {csv_path}")
     print(f"Saved hyperparameters at: {json_path}")
+    print(f"Saved model at: {model_path}")
+
     return submission
+
 
 
 # In[ ]:
@@ -2002,7 +1999,7 @@ submission = save_experiment_output(
     X_test_seq=X_te_win,
     label_mapping={'no_pain': 0, 'low_pain': 1, 'high_pain': 2},
     sample_indices=X_test["sample_index"].unique(),
-    output_dir=OUT_DIR,
+    output_dir=OUTPUT_DIR,
     model=model,
 )
 
@@ -2113,7 +2110,8 @@ for column in scale_columns:
 X_test_seq, _ = build_sequences(X_test, None, window=W_SUGG, stride=S_SUGG)
 
 # 11. Save predictions and configuration
-OUT_DIR = "results_FULL_model"
+
+OUT_DIR = os.path.join(OUTPUT_DIR, "results_FULL_model")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 hyperparams = {
@@ -2465,6 +2463,10 @@ def grid_search_cv_rnn(df, y, param_grid, fixed_params, cv_params, verbose=True,
         best_score: Best mean F1 score achieved
         best_config_epochs: Mean best epoch from best configuration
     """
+
+    # Ensure output directory exists
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
     # Generate all parameter combinations
     param_names = list(param_grid.keys())
     param_values = list(param_grid.values())
@@ -2472,21 +2474,19 @@ def grid_search_cv_rnn(df, y, param_grid, fixed_params, cv_params, verbose=True,
 
     total_possible = len(all_combinations)
 
-
     results = {}
     best_score = -np.inf
     best_config = None
     best_config_epochs = None
 
-    # If n_iter is None, set it to total_possible to run a full grid search
+    # If n_iter is None, run full grid search
     if n_iter is None:
         n_iter = total_possible
 
-    # Se n_iter è minore del totale, scegli N combinazioni a caso
+    # If n_iter < total, pick random subset (Random Search)
     if n_iter < total_possible:
         print(f"--- Eseguendo RANDOM SEARCH ---")
         print(f"Selezionate {n_iter} combinazioni casuali su {total_possible} possibili.")
-        # Use seed for reproducibility
         random.seed(cv_params.get('seed', 42))
         combinations = random.sample(all_combinations, n_iter)
     else:
@@ -2494,8 +2494,10 @@ def grid_search_cv_rnn(df, y, param_grid, fixed_params, cv_params, verbose=True,
         print(f"Testando tutte le {total_possible} combinazioni.")
         combinations = all_combinations
 
+    # ---- MAIN LOOP OVER COMBINATIONS ----
     for idx, combo in enumerate(combinations, 1):
-        # Create current configuration dict
+
+        # Create readable configuration name
         current_config = dict(zip(param_names, combo))
         config_str = "_".join([f"{k}_{v}" for k, v in current_config.items()])
 
@@ -2503,14 +2505,14 @@ def grid_search_cv_rnn(df, y, param_grid, fixed_params, cv_params, verbose=True,
             if n_iter < total_possible:
                 print(f"\nConfiguration {idx}/{n_iter}:")
             else:
-                 print(f"\nConfiguration {idx}/{total_possible}:")
+                print(f"\nConfiguration {idx}/{total_possible}:")
             for param, value in current_config.items():
                 print(f"  {param}: {value}")
 
         # Merge current config with fixed parameters
         run_params = {**fixed_params, **current_config}
 
-        # Execute cross-validation
+        # ---- RUN K-FOLD CROSS VALIDATION ----
         _, _, fold_scores = k_shuffle_split_cross_validation_round_rnn(
             df=df,
             y=y,
@@ -2519,21 +2521,26 @@ def grid_search_cv_rnn(df, y, param_grid, fixed_params, cv_params, verbose=True,
             **cv_params
         )
 
-        # Early pruning: skip config if performance is too poor after initial folds
-        if best_score > -np.inf:  # Only prune after we have a baseline
-            partial_scores = fold_scores.get('scores', [])
-            if len(partial_scores) >= 2:
-                partial_mean = np.mean(partial_scores[:2])
+        # -------------------------------
+        # FIXED EARLY PRUNING LOGIC
+        # -------------------------------
+        if best_score > -np.inf:  # Only prune after first valid baseline exists
+            # Collect first two splits
+            split_keys = sorted([k for k in fold_scores.keys() if k.startswith("split_")])
+            if len(split_keys) >= 2:
+                partial_scores = [fold_scores[k] for k in split_keys[:2]]
+                partial_mean = np.mean(partial_scores)
+
                 if partial_mean < best_score * early_prune_threshold:
                     if verbose:
                         print(f"  [PRUNED] Score {partial_mean:.4f} < {best_score * early_prune_threshold:.4f} (threshold), skipping.")
-                    results[config_str] = fold_scores  # Still save for analysis
+                    results[config_str] = fold_scores  # Save anyway
                     continue
 
-        # Store results
+        # ---- STORE RESULTS ----
         results[config_str] = fold_scores
 
-        # Track best configuration
+        # ---- TRACK BEST CONFIGURATION ----
         if fold_scores["mean"] > best_score:
             best_score = fold_scores["mean"]
             best_config = current_config.copy()
@@ -2544,9 +2551,11 @@ def grid_search_cv_rnn(df, y, param_grid, fixed_params, cv_params, verbose=True,
         if verbose:
             print(f"  F1 Score: {fold_scores['mean']:.4f}±{fold_scores['std']:.4f}")
 
-        # Save checkpoint periodically
+        # -------------------------------
+        # SAVE CHECKPOINT PERIODICALLY
+        # -------------------------------
         if idx % checkpoint_every == 0:
-            checkpoint_path = f'grid_search_checkpoint_{idx}.pkl'
+            checkpoint_path = os.path.join(OUTPUT_DIR, f'grid_search_checkpoint_{idx}.pkl')
             with open(checkpoint_path, 'wb') as f:
                 pickle.dump({
                     'results': results,
@@ -2556,11 +2565,15 @@ def grid_search_cv_rnn(df, y, param_grid, fixed_params, cv_params, verbose=True,
                     'completed_idx': idx,
                     'total': n_iter if n_iter < total_possible else total_possible
                 }, f)
+
             if verbose:
                 print(f"  [CHECKPOINT] Salvato in {checkpoint_path}")
 
-    # Final save
-    final_path = 'grid_search_final.pkl'
+    # -------------------------------
+    # FINAL SAVE
+    # -------------------------------
+    final_path = os.path.join(OUTPUT_DIR, 'grid_search_final.pkl')
+
     with open(final_path, 'wb') as f:
         pickle.dump({
             'results': results,
@@ -2568,10 +2581,10 @@ def grid_search_cv_rnn(df, y, param_grid, fixed_params, cv_params, verbose=True,
             'best_score': best_score,
             'best_config_epochs': best_config_epochs
         }, f)
+
     print(f"\n[COMPLETATO] Risultati salvati in {final_path}")
 
     return results, best_config, best_score, best_config_epochs
-
 
 def plot_top_configurations_rnn(results, k_splits, top_n=5, figsize=(14, 7)):
     """
@@ -2905,7 +2918,7 @@ for column in scale_columns:
 X_test_seq, _ = build_sequences(X_test, None, window=final_best_params["window"], stride=final_best_params["stride"])
 
 # 11. Save predictions and configuration
-OUT_DIR = "results_best_model1"
+OUT_DIR = os.path.join(OUTPUT_DIR, "results_best_model1")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 hyperparams = final_best_params.copy()
@@ -3143,7 +3156,8 @@ for column in scale_columns:
 X_test_seq, _ = build_sequences(X_test, None, window=final_best_params["window"], stride=final_best_params["stride"])
 
 # 11. Save predictions and configuration
-OUT_DIR = "results_best_model2"
+
+OUT_DIR = os.path.join(OUTPUT_DIR, "results_best_model2")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 hyperparams = final_best_params.copy()
@@ -3378,7 +3392,7 @@ for column in scale_columns:
 X_test_seq, _ = build_sequences(X_test, None, window=final_best_params["window"], stride=final_best_params["stride"])
 
 # 11. Save predictions and configuration
-OUT_DIR = "results_best_model3"
+OUT_DIR = os.path.join(OUTPUT_DIR, "results_best_model3")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 hyperparams = final_best_params.copy()
