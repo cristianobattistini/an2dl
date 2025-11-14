@@ -2161,7 +2161,7 @@ def k_shuffle_split_cross_validation_round_rnn(
         evaluation_metric="val_f1", mode='max',
         restore_best_weights=True,
         writer=None, verbose=10, seed=SEED,
-        experiment_name=""
+        experiment_name="", full_config_name=""
     ):
     """
     Perform K-fold shuffle split cross-validation with user-based splitting for time series data.
@@ -2388,8 +2388,13 @@ def k_shuffle_split_cross_validation_round_rnn(
             patience=10,          # Wait 10 epochs before reducing
             min_lr=1e-6
         )
-        # Create directory for model checkpoints
-        os.makedirs(f"models/{experiment_name}", exist_ok=True)
+        model_dir = os.path.join(OUTPUT_DIR, "experiments", experiment_name)
+        os.makedirs(model_dir, exist_ok=True)
+
+
+        # Save full readable config name
+        with open(os.path.join(model_dir, "full_config.txt"), "w") as f:
+            f.write(full_config_name)
 
         # Validation criterion (standard CrossEntropy without smoothing)
         val_criterion = nn.CrossEntropyLoss().to(device)
@@ -2443,6 +2448,17 @@ def k_shuffle_split_cross_validation_round_rnn(
 
 import pickle
 
+import hashlib
+import json
+
+import json
+import zlib
+import base64
+
+def config_hash(config: dict) -> str:
+    raw = json.dumps(config, sort_keys=True)
+    return hashlib.md5(raw.encode()).hexdigest()[:12] 
+
 def grid_search_cv_rnn(df, y, param_grid, fixed_params, cv_params, verbose=True, n_iter=60,
                        checkpoint_every=10, early_prune_threshold=0.8):
     """
@@ -2463,10 +2479,6 @@ def grid_search_cv_rnn(df, y, param_grid, fixed_params, cv_params, verbose=True,
         best_score: Best mean F1 score achieved
         best_config_epochs: Mean best epoch from best configuration
     """
-
-    # Ensure output directory exists
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
     # Generate all parameter combinations
     param_names = list(param_grid.keys())
     param_values = list(param_grid.values())
@@ -2474,19 +2486,21 @@ def grid_search_cv_rnn(df, y, param_grid, fixed_params, cv_params, verbose=True,
 
     total_possible = len(all_combinations)
 
+
     results = {}
     best_score = -np.inf
     best_config = None
     best_config_epochs = None
 
-    # If n_iter is None, run full grid search
+    # If n_iter is None, set it to total_possible to run a full grid search
     if n_iter is None:
         n_iter = total_possible
 
-    # If n_iter < total, pick random subset (Random Search)
+    # Se n_iter è minore del totale, scegli N combinazioni a caso
     if n_iter < total_possible:
         print(f"--- Eseguendo RANDOM SEARCH ---")
         print(f"Selezionate {n_iter} combinazioni casuali su {total_possible} possibili.")
+        # Use seed for reproducibility
         random.seed(cv_params.get('seed', 42))
         combinations = random.sample(all_combinations, n_iter)
     else:
@@ -2494,53 +2508,51 @@ def grid_search_cv_rnn(df, y, param_grid, fixed_params, cv_params, verbose=True,
         print(f"Testando tutte le {total_possible} combinazioni.")
         combinations = all_combinations
 
-    # ---- MAIN LOOP OVER COMBINATIONS ----
     for idx, combo in enumerate(combinations, 1):
-
-        # Create readable configuration name
+        # Create current configuration dict
         current_config = dict(zip(param_names, combo))
-        config_str = "_".join([f"{k}_{v}" for k, v in current_config.items()])
+        config_hash_id = config_hash(current_config)
+        config_str = config_hash_id       # <-- nome della directory del modello
+        full_config_name = "_".join([f"{k}_{v}" for k, v in current_config.items()])
+
+
 
         if verbose:
             if n_iter < total_possible:
                 print(f"\nConfiguration {idx}/{n_iter}:")
             else:
-                print(f"\nConfiguration {idx}/{total_possible}:")
+                 print(f"\nConfiguration {idx}/{total_possible}:")
             for param, value in current_config.items():
                 print(f"  {param}: {value}")
 
         # Merge current config with fixed parameters
         run_params = {**fixed_params, **current_config}
 
-        # ---- RUN K-FOLD CROSS VALIDATION ----
+        # Execute cross-validation
         _, _, fold_scores = k_shuffle_split_cross_validation_round_rnn(
             df=df,
             y=y,
             experiment_name=config_str,
+            full_config_name=full_config_name, 
             **run_params,
             **cv_params
         )
 
-        # -------------------------------
-        # FIXED EARLY PRUNING LOGIC
-        # -------------------------------
-        if best_score > -np.inf:  # Only prune after first valid baseline exists
-            # Collect first two splits
-            split_keys = sorted([k for k in fold_scores.keys() if k.startswith("split_")])
-            if len(split_keys) >= 2:
-                partial_scores = [fold_scores[k] for k in split_keys[:2]]
-                partial_mean = np.mean(partial_scores)
-
+        # Early pruning: skip config if performance is too poor after initial folds
+        if best_score > -np.inf:  # Only prune after we have a baseline
+            partial_scores = fold_scores.get('scores', [])
+            if len(partial_scores) >= 2:
+                partial_mean = np.mean(partial_scores[:2])
                 if partial_mean < best_score * early_prune_threshold:
                     if verbose:
                         print(f"  [PRUNED] Score {partial_mean:.4f} < {best_score * early_prune_threshold:.4f} (threshold), skipping.")
-                    results[config_str] = fold_scores  # Save anyway
+                    results[config_str] = fold_scores  # Still save for analysis
                     continue
 
-        # ---- STORE RESULTS ----
+        # Store results
         results[config_str] = fold_scores
 
-        # ---- TRACK BEST CONFIGURATION ----
+        # Track best configuration
         if fold_scores["mean"] > best_score:
             best_score = fold_scores["mean"]
             best_config = current_config.copy()
@@ -2551,11 +2563,9 @@ def grid_search_cv_rnn(df, y, param_grid, fixed_params, cv_params, verbose=True,
         if verbose:
             print(f"  F1 Score: {fold_scores['mean']:.4f}±{fold_scores['std']:.4f}")
 
-        # -------------------------------
-        # SAVE CHECKPOINT PERIODICALLY
-        # -------------------------------
+        # Save checkpoint periodically
         if idx % checkpoint_every == 0:
-            checkpoint_path = os.path.join(OUTPUT_DIR, f'grid_search_checkpoint_{idx}.pkl')
+            checkpoint_path = f'grid_search_checkpoint_{idx}.pkl'
             with open(checkpoint_path, 'wb') as f:
                 pickle.dump({
                     'results': results,
@@ -2565,13 +2575,10 @@ def grid_search_cv_rnn(df, y, param_grid, fixed_params, cv_params, verbose=True,
                     'completed_idx': idx,
                     'total': n_iter if n_iter < total_possible else total_possible
                 }, f)
-
             if verbose:
                 print(f"  [CHECKPOINT] Salvato in {checkpoint_path}")
 
-    # -------------------------------
-    # FINAL SAVE
-    # -------------------------------
+    # Final save
     final_path = os.path.join(OUTPUT_DIR, 'grid_search_final.pkl')
 
     with open(final_path, 'wb') as f:
@@ -2581,10 +2588,107 @@ def grid_search_cv_rnn(df, y, param_grid, fixed_params, cv_params, verbose=True,
             'best_score': best_score,
             'best_config_epochs': best_config_epochs
         }, f)
-
     print(f"\n[COMPLETATO] Risultati salvati in {final_path}")
 
     return results, best_config, best_score, best_config_epochs
+
+
+def plot_top_configurations_rnn(results, k_splits, top_n=5, figsize=(14, 7)):
+    """
+    Visualise top N RNN configurations with boxplots of F1 scores across CV splits.
+
+    Args:
+        results: Dict of results from grid_search_cv_rnn
+        k_splits: Number of CV splits used
+        top_n: Number of top configurations to display
+        figsize: Figure size tuple
+    """
+    # Sort by mean score
+    config_scores = {name: data['mean'] for name, data in results.items()}
+    sorted_configs = sorted(config_scores.items(), key=lambda x: x[1], reverse=True)
+
+    # Select top N
+    top_configs = sorted_configs[:min(top_n, len(sorted_configs))]
+
+    # Prepare boxplot data
+    boxplot_data = []
+    labels = []
+
+    # Define a dictionary for replacements, ordered to handle prefixes correctly
+    replacements = {
+        'window_':'W=',
+        'stride_':'S=',
+        'batch_size_': 'BS=',
+        'learning_rate_': '\nLR=',
+        'hidden_layers_': '\nHL=',
+        'hidden_size_': '\nHS=',
+        'dropout_rate_': '\nDR=',
+        'rnn_type_': '\nRNN=',
+        'bidirectional_': '\nBIDIR=',
+        'l1_lambda_': '\nL1=',
+        'l2_lambda_': '\nL2='
+    }
+
+    # Replacements for separators
+    separator_replacements = {
+        '_window_':'\nW=',
+        '_stride_':'\nS=',
+        '_learning_rate_': '\nLR=',
+        '_hidden_layers_': '\nHL=',
+        '_hidden_size_': '\nHS=',
+        '_dropout_rate_': '\nDR=',
+        '_rnn_type_': '\nRNN=',
+        '_bidirectional_': '\nBIDIR=',
+        '_l1_lambda_': '\nL1=',
+        '_l2_lambda_': '\nL2=',
+        '_': ''
+    }
+
+    for config_name, mean_score in top_configs:
+        # Extract best score from each split (auto-detect number of splits)
+        split_scores = []
+        for i in range(k_splits):
+            if f'split_{i}' in results[config_name]:
+                split_scores.append(results[config_name][f'split_{i}'])
+        boxplot_data.append(split_scores)
+
+        # Verify we have the expected number of splits
+        if len(split_scores) != k_splits:
+            print(f"Warning: Config {config_name} has {len(split_scores)} splits, expected {k_splits}")
+
+        # Create readable label using the replacements dictionary
+        readable_label = config_name
+        for old, new in replacements.items():
+            readable_label = readable_label.replace(old, new)
+
+        # Apply separator replacements
+        for old, new in separator_replacements.items():
+             readable_label = readable_label.replace(old, new)
+
+        labels.append(f"{readable_label}\n(μ={mean_score:.3f})")
+
+    # Create plot
+    fig, ax = plt.subplots(figsize=figsize)
+    bp = ax.boxplot(boxplot_data, labels=labels, patch_artist=True,
+                    showmeans=True, meanline=True)
+
+    # Styling
+    for patch in bp['boxes']:
+        patch.set_facecolor('lightblue')
+        patch.set_alpha(0.7)
+
+    # Highlight best configuration
+    ax.get_xticklabels()[0].set_fontweight('bold')
+
+    ax.set_ylabel('F1 Score')
+    ax.set_xlabel('Configuration')
+    ax.set_title(f'Top {len(top_configs)} RNN Configurations - F1 Score Distribution Across {k_splits} Splits')
+    ax.grid(alpha=0.3, axis='y')
+
+    plt.xticks(rotation=0, ha='center')
+    plt.tight_layout()
+    plt.show()
+
 
 def plot_top_configurations_rnn(results, k_splits, top_n=5, figsize=(14, 7)):
     """
